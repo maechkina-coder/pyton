@@ -368,6 +368,225 @@ def all_tables(sql: str, parent_ctes: set = None, _depth: int = 0) -> dict:
 
 # ── SELECT-clause extraction ──────────────────────────────────────────────────
 
+def get_raw_select_clause(sql: str) -> str:
+    """
+    Return the raw text (with -- and /* */ comments preserved) between the
+    first top-level SELECT and the first top-level FROM.
+    Handles inline comments during position tracking so they never interfere.
+    """
+    in_str, str_ch = False, None
+    in_line_cmt, in_block_cmt = False, False
+    depth, sel_end = 0, -1
+    i = 0
+    upper = sql.upper()
+
+    # Phase 1: find SELECT at depth 0, ignoring comments
+    while i < len(sql):
+        ch = sql[i]
+        two = sql[i:i + 2]
+        if in_block_cmt:
+            if two == '*/':
+                in_block_cmt = False; i += 2; continue
+        elif in_line_cmt:
+            if ch == '\n': in_line_cmt = False
+        elif in_str:
+            if ch == str_ch: in_str = False
+        elif two == '/*': in_block_cmt = True; i += 2; continue
+        elif two == '--': in_line_cmt = True
+        elif ch in ("'", '"'): in_str, str_ch = True, ch
+        elif ch == '(': depth += 1
+        elif ch == ')': depth -= 1
+        elif depth == 0 and not in_line_cmt:
+            if upper[i:i + 6] == 'SELECT':
+                b = sql[i - 1] if i > 0 else ' '
+                a = sql[i + 6] if i + 6 < len(sql) else ' '
+                if not (b.isalnum() or b in '_$') and \
+                   not (a.isalnum() or a in '_$'):
+                    sel_end = i + 6; break
+        i += 1
+
+    if sel_end < 0:
+        return ''
+
+    rest = sql[sel_end:]
+    rest = re.sub(r'^\s*(DISTINCT|ALL)\b', '', rest, flags=re.IGNORECASE)
+    rest = re.sub(r'^\s*TOP\s+\d+\b',      '', rest, flags=re.IGNORECASE)
+
+    # Phase 2: find FROM at depth 0
+    in_str, str_ch = False, None
+    in_line_cmt, in_block_cmt = False, False
+    depth = 0
+    upper = rest.upper()
+    i = 0
+
+    while i < len(rest):
+        ch = rest[i]
+        two = rest[i:i + 2]
+        if in_block_cmt:
+            if two == '*/':
+                in_block_cmt = False; i += 2; continue
+        elif in_line_cmt:
+            if ch == '\n': in_line_cmt = False
+        elif in_str:
+            if ch == str_ch: in_str = False
+        elif two == '/*': in_block_cmt = True; i += 2; continue
+        elif two == '--': in_line_cmt = True
+        elif ch in ("'", '"'): in_str, str_ch = True, ch
+        elif ch == '(': depth += 1
+        elif ch == ')': depth -= 1
+        elif depth == 0 and not in_line_cmt:
+            if upper[i:i + 4] == 'FROM':
+                b = rest[i - 1] if i > 0 else ' '
+                a = rest[i + 4] if i + 4 < len(rest) else ' '
+                if not (b.isalnum() or b in '_$') and \
+                   not (a.isalnum() or a in '_$'):
+                    return rest[:i]
+        i += 1
+
+    return rest
+
+
+def split_columns_raw(raw_clause: str) -> list:
+    """
+    Split a SELECT column list by depth-0 commas, preserving inline comments.
+
+    Key behaviour: when a comma is followed by a '-- comment' on the SAME LINE,
+    that comment is included in the CURRENT column (not the next), because it
+    describes the column that just ended:
+
+        m.MEMBER_ID,   -- Unique member identifier   ← attached to MEMBER_ID
+        m.FIRST_NM,    -- First name
+
+    -- ... newline  and  /* ... */  are treated as non-splitting.
+    Returns list of raw column strings (comments intact).
+    """
+    cols, cur = [], []
+    depth = 0
+    in_str, str_ch = False, None
+    in_line_cmt, in_block_cmt = False, False
+    i = 0
+    n = len(raw_clause)
+
+    while i < n:
+        ch = raw_clause[i]
+        two = raw_clause[i:i + 2]
+
+        if in_block_cmt:
+            cur.append(ch)
+            if two == '*/':
+                cur.append(raw_clause[i + 1])
+                in_block_cmt = False; i += 2; continue
+        elif in_line_cmt:
+            cur.append(ch)
+            if ch == '\n': in_line_cmt = False
+        elif in_str:
+            cur.append(ch)
+            if ch == str_ch: in_str = False
+        elif two == '/*':
+            in_block_cmt = True; cur.append(ch)
+        elif two == '--':
+            in_line_cmt = True; cur.append(ch)
+        elif ch in ("'", '"'):
+            in_str, str_ch = True, ch; cur.append(ch)
+        elif ch == '(':
+            depth += 1; cur.append(ch)
+        elif ch == ')':
+            depth -= 1; cur.append(ch)
+        elif ch == ',' and depth == 0:
+            # Peek ahead on the same line for a trailing -- comment.
+            # If found, absorb it into the current column before splitting.
+            j = i + 1
+            while j < n and raw_clause[j] in (' ', '\t'):
+                j += 1
+            if raw_clause[j:j + 2] == '--':
+                # Read to end of line and add to current column
+                eol = raw_clause.find('\n', j)
+                eol = eol if eol != -1 else n
+                cur.append(' ')
+                cur.extend(raw_clause[j:eol])
+                i = eol          # resume after the absorbed comment
+            col = ''.join(cur).strip()
+            if col: cols.append(col)
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+
+    col = ''.join(cur).strip()
+    if col: cols.append(col)
+    return cols
+
+
+def _looks_like_sql(text: str) -> bool:
+    """
+    Return True if a comment string looks like commented-out SQL code
+    rather than a human-readable description.
+    Heuristics:
+      - starts with a SQL keyword
+      - contains alias.field dot notation
+      - contains SQL operators, function calls, or quoted literals
+    """
+    t = text.strip()
+    if not t:
+        return False
+    first = re.match(r'^(\w+)', t)
+    if first and first.group(1).upper() in (SQL_KEYWORDS | SESSION_KEYWORDS):
+        return True
+    if re.search(r'\b\w+\.\w+', t):           return True   # alias.field
+    if re.search(r'\b\w+\s*\(', t):           return True   # func(
+    if re.search(r"=\s*'", t):                return True   # = 'value'
+    if re.search(r'\b(AND|OR|NOT)\b', t, re.IGNORECASE): return True
+    return False
+
+
+def extract_inline_comment(raw_col: str) -> str:
+    """
+    Extract the most relevant -- comment from a raw column expression
+    and return it as the Short Description.
+
+    Priority:
+    1. Trailing inline comment on the last code line:
+           m.MEMBER_ID,  -- Unique member identifier
+    2. Leading pure-comment line that is plain English (section header):
+           -- Delinquency flag
+           a.CAD_IND,
+
+    Commented-out SQL code is detected and ignored:
+           -- CASE WHEN a.X = 1 THEN 'Y' END,   ← skipped
+           -- m.OLD_FIELD,                         ← skipped
+    """
+    lines = raw_col.split('\n')
+    section_comment = ''
+
+    # Collect first pure-comment line that is NOT commented-out SQL
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('--'):
+            text = stripped[2:].strip()
+            if text and not _looks_like_sql(text):
+                section_comment = text
+                break
+
+    # Check the last non-empty, non-comment line for a trailing --
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('--'):
+            continue
+        in_str, str_ch = False, None
+        for j, c in enumerate(line):
+            if not in_str and c in ("'", '"'):
+                in_str, str_ch = True, c
+            elif in_str and c == str_ch:
+                in_str = False
+            elif not in_str and line[j:j + 2] == '--':
+                comment = line[j + 2:].strip()
+                if comment and not _looks_like_sql(comment):
+                    return comment        # inline description takes priority
+        break
+
+    return section_comment
+
+
 def get_select_clause(sql: str) -> str:
     """
     Return the text between the first TOP-LEVEL SELECT keyword and the
@@ -733,7 +952,7 @@ def window_logic(expr: str) -> str:
 
 # ── Column row builder ────────────────────────────────────────────────────────
 
-def parse_column(col_expr: str, alias_map: dict) -> dict:
+def parse_column(col_expr: str, alias_map: dict, short_desc: str = '') -> dict:
     col_expr = norm(strip_comments(col_expr))
     if not col_expr:
         return None
@@ -758,7 +977,7 @@ def parse_column(col_expr: str, alias_map: dict) -> dict:
     return {
         "Output Column Name":          output_col,
         "Original Request Field Name": norm(raw),
-        "Short Description":           '',
+        "Short Description":           short_desc,
         "Long Description":            '',
         "Key / Possible Values":       kv,
         "Derived":                     derived,
@@ -777,13 +996,18 @@ def process_statement(stmt: str) -> list:
     # Collect all physical tables from EVERY union part, recursively
     alias_map = all_tables(' '.join(parts))
 
-    select_clause = get_select_clause(first_sql)
-    if not select_clause:
+    # Use the ORIGINAL stmt (comments preserved) so -- can become Short Description.
+    # get_raw_select_clause already finds the first top-level SELECT correctly,
+    # so passing the full stmt works for both plain queries and UNION ALL.
+    raw_clause = get_raw_select_clause(stmt)
+    if not raw_clause:
         return []
 
     rows = []
-    for col_expr in split_columns(select_clause):
-        row = parse_column(col_expr, alias_map)
+    for raw_col in split_columns_raw(raw_clause):
+        short_desc = extract_inline_comment(raw_col)
+        col_expr   = norm(strip_comments(raw_col))
+        row = parse_column(col_expr, alias_map, short_desc=short_desc)
         if row:
             rows.append(row)
     return rows
