@@ -1,12 +1,20 @@
 """
-SQL Data Dictionary Extractor
+SQL Data Dictionary Extractor  v3  (Snowflake-compatible)
 
-Reads a .sql file containing multiple statements (including session
-initialization), identifies SELECT statements, parses each one, and
-writes a CSV data dictionary.
+Handles:
+  - Snowflake SQL: /* */ and -- comments, :: casting, :field semi-structured,
+    double-quoted identifiers, $N positional references, QUALIFY clause
+  - Nested SELECT / subqueries  (recursive table collection)
+  - CTEs  (WITH ... AS (...))
+  - UNION / UNION ALL
+  - Analytics / window functions: RANK, DENSE_RANK, ROW_NUMBER, NTILE,
+    LEAD, LAG, FIRST_VALUE, LAST_VALUE, SUM/COUNT/AVG OVER (...),
+    LISTAGG ... WITHIN GROUP (ORDER BY ...) etc.
+    PARTITION BY, ORDER BY, and frame clauses are captured in the Logic field.
+  - Session-initialization statements are skipped automatically
 
 Usage:
-    python sql_to_data_dict.py input.sql [output.csv]
+    python sql_to_data_dict.py  input.sql  [output.csv]
 """
 
 import sys
@@ -17,13 +25,11 @@ import os
 try:
     import sqlparse
 except ImportError:
-    print("Error: sqlparse is required. Run: pip install sqlparse")
+    print("Error: sqlparse is required.  Run:  pip install sqlparse")
     sys.exit(1)
 
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+# ── CSV schema ────────────────────────────────────────────────────────────────
 
 CSV_HEADERS = [
     "Output Column Name",
@@ -37,538 +43,766 @@ CSV_HEADERS = [
     "Logic",
 ]
 
-# First keywords that identify session/init statements (not data queries)
+
+# ── Keyword sets ──────────────────────────────────────────────────────────────
+
+# First keyword of statements that should be skipped
 SESSION_KEYWORDS = frozenset({
     "SET", "USE", "DECLARE", "ALTER", "GO", "EXEC", "EXECUTE",
     "DROP", "TRUNCATE", "GRANT", "REVOKE", "BEGIN", "COMMIT",
-    "ROLLBACK", "CREATE", "INSERT", "UPDATE", "DELETE", "PRINT",
-    "RAISERROR", "THROW", "IF", "WHILE", "RETURN",
+    "ROLLBACK", "PRINT", "RAISERROR", "THROW", "IF", "WHILE",
+    "RETURN", "INSERT", "UPDATE", "DELETE",
 })
 
-# SQL keywords to exclude when extracting base field names
+# Words that must not be treated as field or table names
 SQL_KEYWORDS = frozenset({
+    # DML / clause keywords
     "CASE", "WHEN", "THEN", "ELSE", "END", "AND", "OR", "NOT", "NULL",
-    "AS", "IN", "IS", "BETWEEN", "LIKE", "TRUE", "FALSE",
-    "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER",
-    "OUTER", "FULL", "CROSS", "ON", "GROUP", "BY", "ORDER", "HAVING",
-    "OVER", "PARTITION", "ROWS", "RANGE", "DISTINCT", "TOP", "LIMIT",
-    "ALL", "UNION", "EXCEPT", "INTERSECT", "WITH", "RECURSIVE",
-    "CAST", "CONVERT", "COALESCE", "NULLIF", "IIF", "DECODE",
-    "COUNT", "SUM", "AVG", "MIN", "MAX", "ROW_NUMBER", "RANK",
-    "DENSE_RANK", "LEAD", "LAG", "FIRST_VALUE", "LAST_VALUE", "NTILE",
-    "GETDATE", "NOW", "CURRENT_DATE", "CURRENT_TIMESTAMP", "TODAY",
-    "DATEPART", "DATEDIFF", "DATEADD", "YEAR", "MONTH", "DAY",
-    "SUBSTRING", "SUBSTR", "LEN", "LENGTH", "TRIM", "UPPER", "LOWER",
-    "REPLACE", "CONCAT", "CATX", "DATE", "TIME",
-    "NOCOUNT", "OFF", "ON", "ASC", "DESC", "NULLS", "FIRST", "LAST",
+    "AS", "IN", "IS", "BETWEEN", "LIKE", "ILIKE", "RLIKE", "TRUE", "FALSE",
+    "EXISTS", "ANY", "ALL", "SOME",
+    "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER",
+    "FULL", "CROSS", "LATERAL", "ON", "USING", "GROUP", "BY", "ORDER",
+    "HAVING", "QUALIFY", "OVER", "PARTITION", "ROWS", "RANGE", "DISTINCT",
+    "TOP", "LIMIT", "OFFSET", "FETCH", "NEXT", "ONLY",
+    "UNION", "EXCEPT", "INTERSECT", "WITH", "RECURSIVE",
+    "PIVOT", "UNPIVOT", "SAMPLE", "TABLESAMPLE", "FLATTEN", "TABLE",
+    "ASC", "DESC", "NULLS", "FIRST", "LAST",
     "PRECEDING", "FOLLOWING", "UNBOUNDED", "CURRENT", "ROW",
-    "YES", "NO", "UNKNOWN", "ACTIVE", "CLOSED", "HIGH", "MEDIUM", "LOW",
+    "WITHIN", "GROUP",          # LISTAGG ... WITHIN GROUP (ORDER BY ...)
+    # Snowflake / ANSI functions (commonly appear as bare words)
+    "CAST", "TRY_CAST", "CONVERT", "COALESCE", "NULLIF", "IFF", "IIF",
+    "DECODE", "NVL", "NVL2", "ZEROIFNULL", "IFNULL",
+    "COUNT", "SUM", "AVG", "MIN", "MAX", "MEDIAN", "STDDEV", "VARIANCE",
+    "ROW_NUMBER", "RANK", "DENSE_RANK", "LEAD", "LAG", "NTILE",
+    "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE", "CUME_DIST", "PERCENT_RANK",
+    "LISTAGG", "ARRAY_AGG", "OBJECT_AGG", "BOOLOR_AGG", "BOOLAND_AGG",
+    "GETDATE", "NOW", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP",
+    "SYSDATE", "TODAY",
+    "DATEADD", "DATEDIFF", "DATEPART", "DATE_PART", "DATE_TRUNC", "TRUNC",
+    "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
+    "QUARTER", "WEEK", "DAYOFWEEK", "DAYOFYEAR",
+    "TO_DATE", "TO_TIMESTAMP", "TO_TIME", "TO_CHAR", "TO_NUMBER",
+    "TRY_TO_DATE", "TRY_TO_TIMESTAMP", "TRY_TO_NUMBER",
+    "SUBSTRING", "SUBSTR", "LEFT", "RIGHT", "LEN", "LENGTH",
+    "TRIM", "LTRIM", "RTRIM", "UPPER", "LOWER", "INITCAP",
+    "REPLACE", "REGEXP_REPLACE", "CONCAT", "CONCAT_WS", "SPLIT_PART",
+    "CHARINDEX", "POSITION", "CONTAINS", "STARTSWITH", "ENDSWITH",
+    "ROUND", "FLOOR", "CEILING", "CEIL", "ABS", "SIGN",
+    "POWER", "SQRT", "MOD", "RANDOM", "UNIFORM", "GREATEST", "LEAST",
+    "PARSE_JSON", "GET", "GET_PATH", "OBJECT_CONSTRUCT",
+    "ARRAY_CONSTRUCT", "ARRAY_SIZE", "ARRAY_CONTAINS",
+    "TYPEOF", "CHECK_JSON", "IS_NULL_VALUE",
+    # Type names (Snowflake)
+    "VARCHAR", "NUMBER", "INTEGER", "INT", "BIGINT", "SMALLINT",
+    "FLOAT", "DOUBLE", "BOOLEAN", "DATE", "TIME", "TIMESTAMP",
+    "TIMESTAMP_NTZ", "TIMESTAMP_LTZ", "TIMESTAMP_TZ",
+    "VARIANT", "ARRAY", "OBJECT", "BINARY", "TEXT", "STRING", "CHAR",
+    # Common value literals that appear as tokens
+    "YES", "NO", "UNKNOWN", "ACTIVE", "CLOSED",
+    "HIGH", "MEDIUM", "LOW", "OTHER", "NONE",
 })
 
-# Patterns for detecting derived expressions
-CASE_PATTERN       = re.compile(r'\bCASE\b',               re.IGNORECASE)
-FUNCTION_PATTERN   = re.compile(r'\b\w+\s*\(',             re.IGNORECASE)
-ARITHMETIC_PATTERN = re.compile(r'(?<![<>!=])[+\-*/](?![>=])')
-CONCAT_PATTERN     = re.compile(r'\|\|')
+# Aliases that look like table aliases but are actually clause keywords
+CLAUSE_WORDS = frozenset({
+    "WHERE", "ON", "AND", "OR", "SET", "WHEN", "THEN", "ELSE", "END",
+    "BY", "HAVING", "QUALIFY", "UNION", "ALL", "SELECT", "WITH",
+    "LEFT", "RIGHT", "INNER", "OUTER", "CROSS", "FULL", "JOIN", "AS",
+    "IN", "NOT", "IS", "NULL", "BETWEEN", "LIKE", "EXISTS", "LATERAL",
+    "OVER", "PARTITION", "ROWS", "RANGE", "LIMIT", "OFFSET",
+    "PIVOT", "UNPIVOT", "SAMPLE", "TABLESAMPLE",
+    "GROUP", "ORDER", "FETCH", "NEXT", "ONLY", "FIRST", "LAST",
+})
 
-# Pattern for table references in FROM / JOIN
-TABLE_REF_PATTERN = re.compile(
-    r'(?:FROM|JOIN)\s+'
-    r'((?:[a-zA-Z_][\w]*\.){0,3}[a-zA-Z_][\w]*)'   # table name (up to 3 parts)
-    r'(?:\s+(?:AS\s+)?([a-zA-Z_][\w]*))?',           # optional alias
-    re.IGNORECASE
-)
 
-# Alias at end of expression: ... AS alias_name
-ALIAS_PATTERN = re.compile(r'\bAS\s+([a-zA-Z_"\'`][\w"\'`\s]*)\s*$', re.IGNORECASE)
+# ── Compiled patterns ─────────────────────────────────────────────────────────
 
-# Field reference: optional_alias.field  or  just field
-FIELD_REF_PATTERN = re.compile(r'\b(?:[a-zA-Z_]\w*\.)?([a-zA-Z_]\w*)\b')
-
-# THEN / ELSE values in a CASE expression
-THEN_PATTERN = re.compile(
-    r"\bTHEN\s+('(?:[^'\\]|\\.)*'|[^\s,)]+)",
-    re.IGNORECASE
-)
-ELSE_PATTERN = re.compile(
-    r"\bELSE\s+('(?:[^'\\]|\\.)*'|[^\s,)]+)",
-    re.IGNORECASE
-)
-
-# Inline and block comments
 INLINE_COMMENT = re.compile(r'--[^\n]*')
 BLOCK_COMMENT  = re.compile(r'/\*.*?\*/', re.DOTALL)
+STRING_LITERAL = re.compile(r"'(?:[^'\\]|\\.)*'")   # single-quoted strings
 
-# String literals (single-quoted)
-STRING_LITERAL = re.compile(r"'(?:[^'\\]|\\.)*'")
+# FROM/JOIN <table> [AS] [alias]
+# Excludes subqueries with (?!\()
+# Handles: db.schema.table, "Quoted"."Name", $staging_table
+TABLE_REF_PATTERN = re.compile(
+    r'(?:FROM|JOIN)\s+'
+    r'(?!\()(?!\bLATERAL\b)'          # not a subquery, not LATERAL alone
+    r'('
+        r'(?:"[^"]+"|[a-zA-Z_$][\w$]*)'
+        r'(?:\.(?:"[^"]+"|[a-zA-Z_$][\w$]*))*'
+    r')'
+    r'(?:\s+(?:AS\s+)?'
+        r'(?!(?:WHERE|ON|SET|AND|OR|INNER|LEFT|RIGHT|FULL|CROSS|OUTER'
+             r'|JOIN|GROUP|ORDER|HAVING|QUALIFY|UNION|EXCEPT|INTERSECT'
+             r'|LIMIT|OFFSET|PIVOT|UNPIVOT|SAMPLE)\b)'
+        r'([a-zA-Z_$][\w$]*))?',
+    re.IGNORECASE,
+)
+
+# CTE definitions: WITH name AS (  or  , name AS (
+CTE_DEF_PATTERN = re.compile(
+    r'(?:WITH|,)\s*(?:"([^"]+)"|([a-zA-Z_$][\w$]*))\s+AS\s*\(',
+    re.IGNORECASE,
+)
+
+# AS alias at the END of a column expression (outside parens)
+ALIAS_PATTERN = re.compile(
+    r'\bAS\s+("(?:[^"]+)"|[a-zA-Z_$][\w$]*)\s*$',
+    re.IGNORECASE,
+)
+
+# alias.field references inside expressions
+ALIASED_FIELD = re.compile(r'\b([a-zA-Z_$][\w$]*)\.([a-zA-Z_$][\w$]*)\b')
+
+# Any word token (for base field extraction)
+WORD_TOKEN = re.compile(r'\b([a-zA-Z_$][\w$]*)\b|\$\d+')
+
+# Derived-expression detectors
+CASE_RE    = re.compile(r'\bCASE\b',        re.IGNORECASE)
+FUNC_RE    = re.compile(r'\b[\w$]+\s*\(',   re.IGNORECASE)
+ARITH_RE   = re.compile(r'(?<![<>!=\-])[+\-*/](?![>=])')
+CONCAT_RE  = re.compile(r'\|\|')
+SF_CAST_RE = re.compile(r'::[a-zA-Z_][\w]*')   # Snowflake :: cast
+SF_SEMI_RE = re.compile(r':[a-zA-Z_$][\w$]*')  # :field  semi-structured
+
+# Window / analytics function detectors
+OVER_RE         = re.compile(r'\bOVER\s*\(',                       re.IGNORECASE)
+WITHIN_GROUP_RE = re.compile(r'\bWITHIN\s+GROUP\s*\(',            re.IGNORECASE)
+PARTITION_BY_RE = re.compile(r'\bPARTITION\s+BY\s+(.+?)(?=\bORDER\b|\bROWS\b|\bRANGE\b|$)', re.IGNORECASE | re.DOTALL)
+ORDER_BY_RE     = re.compile(r'\bORDER\s+BY\s+(.+?)(?=\bROWS\b|\bRANGE\b|$)',                re.IGNORECASE | re.DOTALL)
+FRAME_RE        = re.compile(r'\b(?:ROWS|RANGE)\s+BETWEEN\s+.+',  re.IGNORECASE)
+
+# Window function names (used to identify and label analytic columns)
+WINDOW_FUNC_NAMES = frozenset({
+    "RANK", "DENSE_RANK", "ROW_NUMBER", "NTILE",
+    "PERCENT_RANK", "CUME_DIST",
+    "LEAD", "LAG", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE",
+    "SUM", "COUNT", "AVG", "MIN", "MAX", "MEDIAN", "STDDEV", "VARIANCE",
+    "LISTAGG", "ARRAY_AGG", "OBJECT_AGG",
+    "RATIO_TO_REPORT",
+})
+
+# THEN / ELSE values inside CASE
+THEN_RE = re.compile(r"\bTHEN\s+('(?:[^'\\]|\\.)*'|\d+(?:\.\d+)?|[A-Za-z_]\w*)", re.IGNORECASE)
+ELSE_RE = re.compile(r"\bELSE\s+('(?:[^'\\]|\\.)*'|\d+(?:\.\d+)?|[A-Za-z_]\w*)", re.IGNORECASE)
 
 
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
+# ── Text utilities ────────────────────────────────────────────────────────────
 
 def strip_comments(sql: str) -> str:
-    """Remove -- and /* */ comments from SQL text."""
     sql = BLOCK_COMMENT.sub(' ', sql)
     sql = INLINE_COMMENT.sub(' ', sql)
     return sql
 
-
 def strip_literals(sql: str) -> str:
-    """Replace string literals with a placeholder so keywords inside
-    string values don't affect parsing."""
     return STRING_LITERAL.sub("''", sql)
 
-
-def normalize(sql: str) -> str:
-    """Collapse whitespace and normalize to single spaces."""
+def norm(sql: str) -> str:
     return re.sub(r'\s+', ' ', sql).strip()
 
 
-def first_keyword(stmt_text: str) -> str:
-    """Return the first non-comment, non-whitespace word of a statement."""
-    cleaned = strip_comments(stmt_text).strip()
-    match = re.match(r'([a-zA-Z_]\w*)', cleaned)
-    return match.group(1).upper() if match else ''
+# ── Statement helpers ─────────────────────────────────────────────────────────
 
+def first_keyword(text: str) -> str:
+    clean = strip_comments(text).strip()
+    m = re.match(r'([a-zA-Z_$][\w$]*)', clean)
+    return m.group(1).upper() if m else ''
 
-# ---------------------------------------------------------------------------
-# Statement filtering
-# ---------------------------------------------------------------------------
-
-def is_session_init(stmt_text: str) -> bool:
-    """Return True if the statement is session initialization, not a query."""
-    cleaned = strip_comments(stmt_text).strip()
-    if not cleaned:
-        return True  # empty / comments-only
-
-    kw = first_keyword(cleaned)
-    if kw in SESSION_KEYWORDS:
-        # CREATE TABLE AS SELECT is a real query — keep it
-        if kw == 'CREATE' and re.search(r'\bSELECT\b', cleaned, re.IGNORECASE):
-            return False
+def is_session_init(stmt: str) -> bool:
+    clean = strip_comments(stmt).strip()
+    if not clean:
         return True
-
+    kw = first_keyword(clean)
+    if kw in SESSION_KEYWORDS:
+        return True
+    # CREATE without a SELECT inside is DDL, not a data query
+    if kw == 'CREATE' and not re.search(r'\bSELECT\b', clean, re.IGNORECASE):
+        return True
     return False
 
-
-def contains_select(stmt_text: str) -> bool:
-    """Return True if the statement contains a SELECT clause."""
-    cleaned = strip_comments(stmt_text)
-    return bool(re.search(r'\bSELECT\b', cleaned, re.IGNORECASE))
+def contains_select(stmt: str) -> bool:
+    return bool(re.search(r'\bSELECT\b', strip_comments(stmt), re.IGNORECASE))
 
 
-# ---------------------------------------------------------------------------
-# UNION ALL splitting
-# ---------------------------------------------------------------------------
+# ── Parenthesis / depth utilities ─────────────────────────────────────────────
 
-def split_on_union(sql: str) -> list:
-    """Split a SQL string on UNION / UNION ALL at the top level (depth 0)."""
-    parts = []
-    depth = 0
+def paren_contents(sql: str) -> list:
+    """
+    Return the inner text of every top-level parenthesised block.
+    Inner nesting is preserved inside each returned string.
+    """
+    results, depth, start = [], 0, -1
+    in_str, str_ch = False, None
     i = 0
-    start = 0
-    upper = sql.upper()
-
     while i < len(sql):
         ch = sql[i]
-        if ch == '(':
+        if not in_str and ch in ("'", '"'):
+            in_str, str_ch = True, ch
+        elif in_str:
+            if ch == str_ch and sql[i - 1:i] != '\\':
+                in_str = False
+        elif ch == '(':
+            if depth == 0:
+                start = i + 1
             depth += 1
         elif ch == ')':
             depth -= 1
-        elif depth == 0:
-            # Check for UNION ALL or UNION
-            for keyword in ('UNION ALL', 'UNION'):
-                klen = len(keyword)
-                if upper[i:i + klen] == keyword:
-                    # Make sure it's a word boundary after
-                    after = upper[i + klen: i + klen + 1]
-                    if not after or not after.isalnum():
-                        parts.append(sql[start:i].strip())
-                        i += klen
-                        start = i
-                        break
-            else:
-                i += 1
-            continue
+            if depth == 0 and start >= 0:
+                results.append(sql[start:i])
+                start = -1
         i += 1
+    return results
 
+
+def split_depth0(sql: str, keyword: str) -> list:
+    """Split sql on keyword only at parenthesis depth 0."""
+    parts, start = [], 0
+    depth, in_str, str_ch = 0, False, None
+    klen  = len(keyword)
+    upper = sql.upper()
+    i     = 0
+    while i < len(sql):
+        ch = sql[i]
+        if not in_str and ch in ("'", '"'):
+            in_str, str_ch = True, ch
+        elif in_str:
+            if ch == str_ch and sql[i - 1:i] != '\\':
+                in_str = False
+        elif ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        elif depth == 0 and not in_str:
+            seg   = upper[i:i + klen]
+            after = upper[i + klen: i + klen + 1]
+            if seg == keyword and (not after or not (after.isalnum() or after == '_')):
+                parts.append(sql[start:i].strip())
+                i += klen
+                start = i
+                continue
+        i += 1
     parts.append(sql[start:].strip())
     return [p for p in parts if p]
 
 
-# ---------------------------------------------------------------------------
-# Table reference extraction
-# ---------------------------------------------------------------------------
+def split_union(sql: str) -> list:
+    """Split on UNION ALL / UNION at depth 0, ignoring occurrences in comments."""
+    clean = strip_comments(sql)   # remove -- and /* */ before splitting
+    parts = split_depth0(clean, 'UNION ALL')
+    return parts if len(parts) > 1 else split_depth0(clean, 'UNION')
 
-def extract_table_references(sql: str) -> dict:
+
+# ── CTE extraction ────────────────────────────────────────────────────────────
+
+def cte_names(sql: str) -> set:
+    """Return upper-case names of all CTEs defined in a WITH clause."""
+    names = set()
+    for m in CTE_DEF_PATTERN.finditer(strip_comments(sql)):
+        name = (m.group(1) or m.group(2)).upper().strip('"')
+        names.add(name)
+    return names
+
+
+# ── Recursive table collection ────────────────────────────────────────────────
+
+def _tables_at_level(sql: str, skip_names: set) -> dict:
     """
-    Return a dict mapping alias (upper) -> full table name
-    for all FROM / JOIN references in the SQL text.
+    Collect physical table references at THIS level only.
+    skip_names = CTE names + clause keywords (should not be treated as tables).
+    Returns: {alias_upper: full_name}
     """
-    cleaned = strip_comments(sql)
-    tables = {}
+    clean  = strip_literals(strip_comments(sql))
+    result = {}
 
-    skip_aliases = SESSION_KEYWORDS | {
-        'WHERE', 'ON', 'AND', 'OR', 'SET', 'WHEN', 'THEN', 'ELSE',
-        'END', 'BY', 'HAVING', 'UNION', 'ALL', 'SELECT', 'WITH',
-    }
+    for m in TABLE_REF_PATTERN.finditer(clean):
+        full  = m.group(1).strip('"')
+        alias = m.group(2)
 
-    for match in TABLE_REF_PATTERN.finditer(cleaned):
-        full_name = match.group(1)
-        alias     = match.group(2)
+        # Skip if the table name itself is a CTE or keyword
+        if full.upper().strip('"') in skip_names:
+            continue
+        if full.split('.')[-1].upper().strip('"') in skip_names:
+            continue
 
-        if alias and alias.upper() in skip_aliases:
+        # Validate alias
+        if alias and (alias.upper() in CLAUSE_WORDS or alias.upper() in skip_names):
             alias = None
 
-        key = (alias or full_name.split('.')[-1]).upper()
-        tables[key] = full_name
+        key = (alias or full.split('.')[-1]).upper().strip('"')
+        if key not in CLAUSE_WORDS and key not in skip_names:
+            result[key] = full
 
-        # Also register the last part of the name (table name without schema)
-        short = full_name.split('.')[-1].upper()
-        if short not in tables:
-            tables[short] = full_name
+        short = full.split('.')[-1].upper().strip('"')
+        if short not in CLAUSE_WORDS and short not in skip_names:
+            result.setdefault(short, full)
 
-        # Register full name as its own key
-        tables[full_name.upper()] = full_name
+        result[full.upper().strip('"')] = full
+
+    return result
+
+
+def all_tables(sql: str, parent_ctes: set = None, _depth: int = 0) -> dict:
+    """
+    Recursively collect every physical table touched by sql, including
+    tables inside subqueries and CTE bodies.
+    Returns {alias_upper: full_name}
+    """
+    if _depth > 20:
+        return {}
+    if parent_ctes is None:
+        parent_ctes = set()
+
+    this_ctes  = cte_names(sql)
+    all_ctes   = parent_ctes | this_ctes
+    skip       = all_ctes | CLAUSE_WORDS
+
+    tables = _tables_at_level(sql, skip)
+
+    # Recurse into every parenthesised block that contains SELECT
+    for content in paren_contents(sql):
+        if re.search(r'\bSELECT\b', content, re.IGNORECASE):
+            for k, v in all_tables(content, all_ctes, _depth + 1).items():
+                tables.setdefault(k, v)
 
     return tables
 
 
-# ---------------------------------------------------------------------------
-# Column list splitting
-# ---------------------------------------------------------------------------
-
-def split_column_list(select_clause: str) -> list:
-    """
-    Split a SELECT column list by commas, respecting nested parentheses.
-    Returns a list of individual column expression strings.
-    """
-    columns = []
-    depth = 0
-    current = []
-
-    for ch in select_clause:
-        if ch == '(':
-            depth += 1
-            current.append(ch)
-        elif ch == ')':
-            depth -= 1
-            current.append(ch)
-        elif ch == ',' and depth == 0:
-            col = ''.join(current).strip()
-            if col:
-                columns.append(col)
-            current = []
-        else:
-            current.append(ch)
-
-    col = ''.join(current).strip()
-    if col:
-        columns.append(col)
-
-    return columns
-
+# ── SELECT-clause extraction ──────────────────────────────────────────────────
 
 def get_select_clause(sql: str) -> str:
     """
-    Extract the text between SELECT and the first top-level FROM.
-    Returns empty string if not found.
+    Return the text between the first TOP-LEVEL SELECT keyword and the
+    first top-level FROM keyword.
+
+    'Top-level' means at parenthesis depth 0, so SELECT keywords inside
+    CTE bodies or subqueries (which are wrapped in parentheses) are skipped.
+    This correctly handles WITH ... AS (...) CTE patterns.
     """
-    # Remove DISTINCT / TOP N / ALL modifiers right after SELECT
-    sql_clean = strip_comments(sql)
-
-    # Find top-level SELECT keyword
-    sel_match = re.search(r'\bSELECT\b', sql_clean, re.IGNORECASE)
-    if not sel_match:
-        return ''
-
-    start = sel_match.end()
-
-    # Remove DISTINCT / ALL / TOP n
-    remainder = sql_clean[start:]
-    remainder = re.sub(r'^\s*(DISTINCT|ALL)\s+', '', remainder, flags=re.IGNORECASE)
-    remainder = re.sub(r'^\s*TOP\s+\d+\s*', '', remainder, flags=re.IGNORECASE)
-
-    # Find FROM at depth 0
-    depth = 0
+    clean = strip_comments(sql)
+    upper = clean.upper()
+    depth, in_str, str_ch = 0, False, None
+    sel_end = -1
     i = 0
-    upper = remainder.upper()
-    while i < len(remainder):
-        ch = remainder[i]
-        if ch == '(':
+
+    # Phase 1: find the first SELECT at depth 0
+    while i < len(clean):
+        ch = clean[i]
+        if not in_str and ch in ("'", '"'):
+            in_str, str_ch = True, ch
+        elif in_str:
+            if ch == str_ch and clean[i - 1:i] != '\\':
+                in_str = False
+        elif ch == '(':
             depth += 1
         elif ch == ')':
             depth -= 1
-        elif depth == 0 and upper[i:i + 4] == 'FROM':
-            # Check word boundary
-            before = remainder[i - 1] if i > 0 else ' '
-            after  = remainder[i + 4] if i + 4 < len(remainder) else ' '
-            if not before.isalnum() and before != '_' and not after.isalnum() and after != '_':
-                return remainder[:i].strip()
+        elif depth == 0 and not in_str:
+            if upper[i:i + 6] == 'SELECT':
+                b = clean[i - 1] if i > 0 else ' '
+                a = clean[i + 6] if i + 6 < len(clean) else ' '
+                if not (b.isalnum() or b in '_$') and \
+                   not (a.isalnum() or a in '_$'):
+                    sel_end = i + 6
+                    break
         i += 1
 
-    return remainder.strip()
+    if sel_end < 0:
+        return ''
+
+    rest = clean[sel_end:]
+    rest = re.sub(r'^\s*(DISTINCT|ALL)\b', '', rest, flags=re.IGNORECASE)
+    rest = re.sub(r'^\s*TOP\s+\d+\b',      '', rest, flags=re.IGNORECASE)
+
+    # Phase 2: find FROM at depth 0 within the remainder
+    depth, in_str, str_ch = 0, False, None
+    upper = rest.upper()
+    i     = 0
+
+    while i < len(rest):
+        ch = rest[i]
+        if not in_str and ch in ("'", '"'):
+            in_str, str_ch = True, ch
+        elif in_str:
+            if ch == str_ch and rest[i - 1:i] != '\\':
+                in_str = False
+        elif ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        elif depth == 0 and not in_str:
+            if upper[i:i + 4] == 'FROM':
+                b = rest[i - 1] if i > 0         else ' '
+                a = rest[i + 4] if i + 4 < len(rest) else ' '
+                if not (b.isalnum() or b in '_$') and \
+                   not (a.isalnum() or a in '_$'):
+                    return rest[:i].strip()
+        i += 1
+
+    return rest.strip()
 
 
-# ---------------------------------------------------------------------------
-# Expression analysis
-# ---------------------------------------------------------------------------
+def split_columns(select_clause: str) -> list:
+    """Split SELECT column list by commas at depth 0."""
+    cols, cur = [], []
+    depth, in_str, str_ch = 0, False, None
 
-def detect_derived(expr: str) -> bool:
-    """Return True if the expression uses functions, CASE, or arithmetic."""
-    # Strip string literals so we don't match keywords inside them
-    clean = strip_literals(expr)
+    for ch in select_clause:
+        if not in_str and ch in ("'", '"'):
+            in_str, str_ch = True, ch
+            cur.append(ch)
+        elif in_str:
+            cur.append(ch)
+            if ch == str_ch:
+                in_str = False
+        elif ch == '(':
+            depth += 1;  cur.append(ch)
+        elif ch == ')':
+            depth -= 1;  cur.append(ch)
+        elif ch == ',' and depth == 0:
+            col = ''.join(cur).strip()
+            if col:
+                cols.append(col)
+            cur = []
+        else:
+            cur.append(ch)
 
-    if CASE_PATTERN.search(clean):
-        return True
-    if CONCAT_PATTERN.search(clean):
-        return True
+    col = ''.join(cur).strip()
+    if col:
+        cols.append(col)
+    return cols
 
-    # Function call: word followed by '('
-    # Exclude bare column references like "table.column"
-    if FUNCTION_PATTERN.search(clean):
-        return True
 
-    # Arithmetic operators not part of comparison operators
-    if ARITHMETIC_PATTERN.search(clean):
-        return True
+# ── Per-column analysis ───────────────────────────────────────────────────────
 
-    return False
+def is_derived(expr: str) -> bool:
+    """True if the expression uses functions, CASE, arithmetic, casts, or window functions."""
+    c = strip_literals(strip_comments(expr))
+    return any([
+        CASE_RE.search(c),
+        CONCAT_RE.search(c),
+        SF_CAST_RE.search(c),
+        SF_SEMI_RE.search(c),
+        OVER_RE.search(c),
+        WITHIN_GROUP_RE.search(c),
+        FUNC_RE.search(c),
+        ARITH_RE.search(c),
+    ])
+
+
+def _flat_alias(expr: str) -> str:
+    """
+    Return a version of expr where content inside parentheses is replaced
+    with spaces, so we can safely run ALIAS_PATTERN on it.
+    """
+    result = []
+    depth  = 0
+    for ch in expr:
+        if ch == '(':
+            depth += 1
+            result.append(' ')
+        elif ch == ')':
+            depth -= 1
+            result.append(' ')
+        elif depth > 0:
+            result.append(' ')
+        else:
+            result.append(ch)
+    return ''.join(result)
 
 
 def extract_alias(expr: str) -> tuple:
-    """
-    Return (alias, raw_expr_without_alias).
-    If no alias, alias is derived from the expression itself.
-    """
-    expr = expr.strip()
+    """Return (output_col_upper, raw_expr_without_alias)."""
+    expr = norm(strip_comments(expr))
 
-    # Find AS alias at the top level (not inside parentheses)
-    depth = 0
-    i = len(expr) - 1
-    alias_start = -1
-
-    # Walk backwards to find the last top-level AS
-    tokens = re.split(r'\s+', expr)
-    # Rebuild token positions
-    pos = len(expr)
-    for tok in reversed(tokens):
-        pos -= len(tok)
-        while pos > 0 and expr[pos - 1] == ' ':
-            pos -= 1
-
-        # Check parenthesis depth at this position
-        depth = expr[:pos].count('(') - expr[:pos].count(')')
-        if depth == 0 and tok.upper() not in ('AS',):
-            # Check if previous token is AS
-            before = expr[:pos].rstrip()
-            if re.search(r'\bAS\s*$', before, re.IGNORECASE):
-                alias = tok.strip('"\'`')
-                raw   = re.sub(r'\s+AS\s+' + re.escape(tok) + r'\s*$', '',
-                               expr, flags=re.IGNORECASE).strip()
-                return alias.upper(), raw
-
-    # Fallback: use regex
-    m = ALIAS_PATTERN.search(expr)
-    if m:
-        alias = m.group(1).strip().strip('"\'`').upper()
-        raw   = expr[:m.start()].strip()
+    flat_m = ALIAS_PATTERN.search(_flat_alias(expr))
+    if flat_m:
+        alias   = flat_m.group(1).strip('"').upper()
+        raw_end = flat_m.start()
+        raw     = expr[:raw_end].strip()
         return alias, raw
 
-    # No alias — use the field name from the expression
-    # If it's table.field, take the field part
-    simple = re.search(r'(?:[a-zA-Z_]\w*\.)?([a-zA-Z_]\w*)\s*$', expr)
-    if simple:
-        return simple.group(1).upper(), expr
+    # No AS — derive name from the expression
+    plain = re.match(r'^(?:[a-zA-Z_$][\w$]*\.)?([a-zA-Z_$][\w$]*)$', expr.strip())
+    if plain:
+        return plain.group(1).upper(), expr
 
     return expr.upper(), expr
 
 
-def extract_base_fields(expr: str) -> list:
-    """Return deduplicated list of base field names (no table alias prefix)."""
-    clean = strip_literals(expr)
-
-    fields = []
-    seen   = set()
-
-    for m in FIELD_REF_PATTERN.finditer(clean):
-        full_token = m.group(0)  # may include alias prefix
-        field_name = m.group(1).upper()
-
-        # Skip SQL keywords, numbers, single chars used as operators
-        if field_name in SQL_KEYWORDS:
-            continue
-        if re.fullmatch(r'\d+', field_name):
-            continue
-        if len(field_name) == 1 and not re.match(r'[A-Z]', field_name):
-            continue
-
-        if field_name not in seen:
-            seen.add(field_name)
-            fields.append(field_name)
-
-    return fields
-
-
-def extract_case_values(expr: str) -> str:
-    """Extract THEN / ELSE result values from a CASE expression."""
-    values = []
-    seen   = set()
-
-    for m in THEN_PATTERN.finditer(expr):
-        val = m.group(1).strip().strip("'")
-        if val.upper() not in SQL_KEYWORDS and val not in seen:
-            seen.add(val)
-            values.append(val)
-
-    for m in ELSE_PATTERN.finditer(expr):
-        val = m.group(1).strip().strip("'")
-        if val.upper() not in SQL_KEYWORDS and val not in seen:
-            seen.add(val)
-            values.append(val)
-
-    return '; '.join(values)
-
-
-def resolve_source_tables(fields: list, tables: dict) -> str:
+def base_fields(expr: str) -> list:
     """
-    Given a list of field references from the expression and the alias map,
-    return a deduplicated list of source table full names.
+    Deduplicated base field names from an expression.
+
+    Rules:
+    - For alias.field patterns, keep only the field name (drop alias prefix).
+    - Remove 3+ part qualified names (db.schema.table) entirely — they are
+      table refs, not column refs.
+    - Skip single-character tokens (table alias letters like m, a, b).
+    - Skip tokens that were seen as alias prefixes.
     """
-    # Re-scan the raw expression for alias.field patterns to get table aliases
-    return ''   # filled in by process_statement after we have the alias map
+    clean = strip_literals(strip_comments(expr))
 
+    # Remove 3+ part table refs (db.schema.table) so their parts don't leak in
+    clean = re.sub(
+        r'\b(?:[a-zA-Z_$][\w$]*\.){2,}[a-zA-Z_$][\w$]*\b',
+        ' ',
+        clean,
+    )
 
-def resolve_tables_from_expr(raw_expr: str, alias_map: dict) -> str:
-    """
-    Look for alias.field patterns in the expression, resolve aliases to
-    full table names, and return a deduplicated comma-separated string.
-    """
-    clean   = strip_literals(strip_comments(raw_expr))
-    pattern = re.compile(r'\b([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\b')
+    result, seen, alias_prefixes = [], set(), set()
 
-    found = []
-    seen  = set()
-
-    for m in pattern.finditer(clean):
+    # Pass 1 — alias.field: collect the field; record the alias as a prefix
+    for m in re.finditer(r'\b([a-zA-Z_$][\w$]*)\.([a-zA-Z_$][\w$]*)\b', clean):
         alias = m.group(1).upper()
-        # Skip things like SCHEMA.TABLE references that aren't aliases
-        full = alias_map.get(alias, '')
+        field = m.group(2).upper()
+        alias_prefixes.add(alias)
+        if field in SQL_KEYWORDS:
+            continue
+        if field not in seen:
+            seen.add(field)
+            result.append(field)
+
+    # Pass 2 — bare words not used as alias prefixes
+    for m in re.finditer(r'\b([a-zA-Z_$][\w$]*)\b|\$\d+', clean):
+        raw  = m.group(0)
+        name = m.group(1)
+
+        if name is None:                    # $N positional reference
+            if raw not in seen:
+                seen.add(raw); result.append(raw)
+            continue
+
+        upper = name.upper()
+        if upper in SQL_KEYWORDS:           continue
+        if upper in alias_prefixes:         continue  # was a table alias
+        if upper in seen:                   continue
+        if re.fullmatch(r'\d+', name):      continue
+        if len(name) == 1:                  continue  # single-char alias
+
+        seen.add(upper)
+        result.append(upper)
+
+    return result
+
+
+def case_values(expr: str) -> str:
+    """THEN/ELSE result values from a CASE expression."""
+    vals, seen = [], set()
+    for pat in (THEN_RE, ELSE_RE):
+        for m in pat.finditer(expr):
+            v = m.group(1).strip().strip("'")
+            if v.upper() not in SQL_KEYWORDS and v not in seen:
+                seen.add(v); vals.append(v)
+    return '; '.join(vals)
+
+
+def source_tables(raw_expr: str, alias_map: dict) -> str:
+    """
+    Resolve source tables for a single column expression.
+    Handles aliased references (a.FIELD), unaliased references, and
+    scalar subqueries.
+    """
+    clean = strip_literals(strip_comments(raw_expr))
+    found, seen = [], set()
+
+    # aliased references: alias.field
+    for m in ALIASED_FIELD.finditer(clean):
+        alias = m.group(1).upper()
+        full  = alias_map.get(alias, '')
         if full and full not in seen:
-            seen.add(full)
-            found.append(full)
+            seen.add(full); found.append(full)
 
-    # If no alias.field found but there's only one table, assign it
-    if not found and len(alias_map) == 1:
-        return next(iter(alias_map.values()))
+    # scalar subquery: (SELECT ... FROM ...)
+    if not found and '(' in raw_expr:
+        for content in paren_contents(raw_expr):
+            if re.search(r'\bSELECT\b', content, re.IGNORECASE):
+                for v in all_tables(content).values():
+                    if v not in seen:
+                        seen.add(v); found.append(v)
 
-    return ', '.join(found)
+    # fallback: single table in map
+    if not found:
+        physical = [v for k, v in alias_map.items()
+                    if '.' in v or v == k]   # looks like a real table
+        unique = list(dict.fromkeys(physical))
+        if len(unique) == 1:
+            return unique[0]
+
+    return ', '.join(dict.fromkeys(found))
 
 
-# ---------------------------------------------------------------------------
-# Core column parser
-# ---------------------------------------------------------------------------
+# ── Window function helpers ───────────────────────────────────────────────────
+
+def _paren_block(text: str, start: int) -> str:
+    """Return content of the parenthesised block opening at text[start]."""
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == '(':
+            depth += 1
+        elif text[i] == ')':
+            depth -= 1
+            if depth == 0:
+                return text[start + 1: i]
+    return text[start + 1:]
+
+
+def parse_window_details(expr: str) -> dict:
+    """
+    Decompose a window / analytic function expression into its parts.
+
+    Returns a dict with:
+      func_name    – e.g. RANK, SUM, LISTAGG
+      func_args    – arguments inside the function call
+      partition_by – PARTITION BY column list (empty string if absent)
+      order_by     – ORDER BY column list (empty string if absent)
+      frame        – ROWS/RANGE BETWEEN … clause (empty string if absent)
+      within_group – ORDER BY from WITHIN GROUP (for LISTAGG etc.)
+    """
+    result = dict(func_name='', func_args='',
+                  partition_by='', order_by='', frame='', within_group='')
+
+    clean = strip_comments(expr)
+
+    # ── Locate the boundary before OVER / WITHIN GROUP ───────────────────────
+    over_m  = OVER_RE.search(clean)
+    wg_m    = WITHIN_GROUP_RE.search(clean)
+    boundary = min(
+        (m.start() for m in (over_m, wg_m) if m),
+        default=-1,
+    )
+    if boundary == -1:
+        return result
+
+    func_part = clean[:boundary].strip()
+
+    # ── Extract function name and args ────────────────────────────────────────
+    fm = re.match(r'(\w[\w$]*)\s*\((.*)\)\s*$', func_part, re.DOTALL)
+    if fm:
+        result['func_name'] = fm.group(1).upper()
+        result['func_args'] = norm(fm.group(2))
+
+    # ── Extract WITHIN GROUP (ORDER BY ...) ───────────────────────────────────
+    if wg_m:
+        wg_content = _paren_block(clean, wg_m.end() - 1)
+        ord_m = re.search(r'\bORDER\s+BY\s+(.+)', wg_content, re.IGNORECASE | re.DOTALL)
+        if ord_m:
+            result['within_group'] = norm(ord_m.group(1))
+
+    # ── Extract OVER (...) clause ─────────────────────────────────────────────
+    if over_m:
+        over_content = _paren_block(clean, over_m.end() - 1)
+
+        # PARTITION BY
+        pm = PARTITION_BY_RE.search(over_content)
+        if pm:
+            result['partition_by'] = norm(pm.group(1)).rstrip(',').strip()
+
+        # ORDER BY  (inside OVER, not WITHIN GROUP)
+        om = ORDER_BY_RE.search(over_content)
+        if om:
+            result['order_by'] = norm(om.group(1)).rstrip(',').strip()
+
+        # Frame clause
+        fm2 = FRAME_RE.search(over_content)
+        if fm2:
+            result['frame'] = norm(fm2.group(0))
+
+    return result
+
+
+def window_logic(expr: str) -> str:
+    """
+    Build a human-readable Logic string for a window/analytic function.
+    Falls back to the raw expression if no window structure is found.
+    """
+    wd = parse_window_details(expr)
+    if not wd['func_name']:
+        return norm(expr)
+
+    parts = [f"Function: {wd['func_name']}({wd['func_args']})"]
+    if wd['within_group']:
+        parts.append(f"Within Group Order By: {wd['within_group']}")
+    if wd['partition_by']:
+        parts.append(f"Partition By: {wd['partition_by']}")
+    if wd['order_by']:
+        parts.append(f"Order By: {wd['order_by']}")
+    if wd['frame']:
+        parts.append(f"Frame: {wd['frame']}")
+
+    return ' | '.join(parts)
+
+
+# ── Column row builder ────────────────────────────────────────────────────────
 
 def parse_column(col_expr: str, alias_map: dict) -> dict:
-    """
-    Parse a single column expression and return a data dictionary row dict.
-    """
-    # Normalize whitespace, strip inline comments
-    col_expr = strip_comments(col_expr)
-    col_expr = normalize(col_expr)
-
+    col_expr = norm(strip_comments(col_expr))
     if not col_expr:
         return None
 
-    # Handle SELECT *
-    if col_expr.strip() == '*' or re.match(r'^[a-zA-Z_]\w*\.\*$', col_expr.strip()):
+    # SELECT *  or  t.*
+    if re.match(r'^(?:[a-zA-Z_$][\w$]*\.)?\*$', col_expr.strip()):
         return None
 
-    # Extract alias and raw expression
-    output_col, raw_expr = extract_alias(col_expr)
+    output_col, raw = extract_alias(col_expr)
+    derived         = '*' if is_derived(raw) else ''
+    fields          = base_fields(raw)
+    tables          = source_tables(raw, alias_map)
+    kv              = case_values(raw) if CASE_RE.search(raw) else ''
 
-    # Determine if derived
-    derived = '*' if detect_derived(raw_expr) else ''
-
-    # Extract base fields
-    base_fields = extract_base_fields(raw_expr)
-
-    # Resolve source tables
-    source_tables = resolve_tables_from_expr(raw_expr, alias_map)
-
-    # Extract key/possible values from CASE
-    key_values = ''
-    if CASE_PATTERN.search(raw_expr):
-        key_values = extract_case_values(raw_expr)
-
-    # Logic is the raw expression if derived
-    logic = normalize(raw_expr) if derived else ''
+    # Choose logic format: structured for window functions, raw snippet otherwise
+    is_window = bool(OVER_RE.search(raw) or WITHIN_GROUP_RE.search(raw))
+    if derived and is_window:
+        logic = window_logic(raw)
+    else:
+        logic = norm(raw) if derived else ''
 
     return {
-        "Output Column Name":        output_col,
-        "Original Request Field Name": normalize(raw_expr),
-        "Short Description":         '',
-        "Long Description":          '',
-        "Key / Possible Values":     key_values,
-        "Derived":                   derived,
-        "Base Field(s)":             ', '.join(base_fields),
-        "Source Table(s)":           source_tables,
-        "Logic":                     logic,
+        "Output Column Name":          output_col,
+        "Original Request Field Name": norm(raw),
+        "Short Description":           '',
+        "Long Description":            '',
+        "Key / Possible Values":       kv,
+        "Derived":                     derived,
+        "Base Field(s)":               ', '.join(fields),
+        "Source Table(s)":             tables,
+        "Logic":                       logic,
     }
 
 
-# ---------------------------------------------------------------------------
-# Statement processor
-# ---------------------------------------------------------------------------
+# ── Statement processor ───────────────────────────────────────────────────────
 
-def process_statement(stmt_text: str) -> list:
-    """
-    Parse one SELECT statement (which may contain UNION ALL) and return
-    a list of data dictionary row dicts.
-    """
-    parts     = split_on_union(stmt_text)
+def process_statement(stmt: str) -> list:
+    parts     = split_union(stmt)
     first_sql = parts[0]
 
-    # Collect table references from ALL union parts
-    all_tables_sql = ' '.join(parts)
-    alias_map      = extract_table_references(all_tables_sql)
+    # Collect all physical tables from EVERY union part, recursively
+    alias_map = all_tables(' '.join(parts))
 
-    # Get the SELECT column list from the FIRST part only
     select_clause = get_select_clause(first_sql)
     if not select_clause:
         return []
 
-    columns = split_column_list(select_clause)
-    rows    = []
-
-    for col_expr in columns:
+    rows = []
+    for col_expr in split_columns(select_clause):
         row = parse_column(col_expr, alias_map)
         if row:
             rows.append(row)
-
     return rows
 
 
-# ---------------------------------------------------------------------------
-# File I/O
-# ---------------------------------------------------------------------------
+# ── File I/O ──────────────────────────────────────────────────────────────────
 
-def read_sql_file(path: str) -> str:
+def read_sql(path: str) -> str:
     with open(path, 'r', encoding='utf-8-sig') as f:
         return f.read()
 
-
-def write_csv(rows: list, output_path: str):
-    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+def write_csv(rows: list, path: str):
+    with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
         writer.writerows(rows)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     if len(sys.argv) < 2:
@@ -576,7 +810,6 @@ def main():
         sys.exit(1)
 
     input_path = sys.argv[1]
-
     if not os.path.exists(input_path):
         print(f"Error: File not found: {input_path}")
         sys.exit(1)
@@ -587,36 +820,32 @@ def main():
         base        = os.path.splitext(os.path.basename(input_path))[0]
         output_path = os.path.join(
             os.path.dirname(os.path.abspath(input_path)),
-            f"{base}_data_dictionary.csv"
+            f"{base}_data_dictionary.csv",
         )
 
-    sql_text   = read_sql_file(input_path)
+    sql_text   = read_sql(input_path)
     statements = sqlparse.split(sql_text)
 
-    all_rows       = []
-    select_count   = 0
-    skipped_count  = 0
+    all_rows, n_select, n_skip = [], 0, 0
 
-    for raw_stmt in statements:
-        raw_stmt = raw_stmt.strip()
-        if not raw_stmt:
+    for raw in statements:
+        raw = raw.strip()
+        if not raw:
             continue
-
-        if is_session_init(raw_stmt) or not contains_select(raw_stmt):
-            skipped_count += 1
+        if is_session_init(raw) or not contains_select(raw):
+            n_skip += 1
             continue
-
-        rows = process_statement(raw_stmt)
+        rows = process_statement(raw)
         if rows:
-            select_count += 1
+            n_select += 1
             all_rows.extend(rows)
 
     write_csv(all_rows, output_path)
 
-    print(f"Statements skipped (session init): {skipped_count}")
-    print(f"SELECT statements processed:       {select_count}")
-    print(f"Columns extracted:                 {len(all_rows)}")
-    print(f"Output saved: {output_path}")
+    print(f"Session-init statements skipped : {n_skip}")
+    print(f"SELECT statements processed     : {n_select}")
+    print(f"Output columns extracted        : {len(all_rows)}")
+    print(f"Saved                           : {output_path}")
 
 
 if __name__ == '__main__':
